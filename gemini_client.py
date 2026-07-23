@@ -5,12 +5,22 @@ task, current URL, DOM element JSON, and action history; parses the model's
 JSON action out of the response text.
 """
 import json
+import logging
 import re
+import time
 
 import requests
 
 from config import GEMINI_API_KEY, GEMINI_ENDPOINT
 from actions import SYSTEM_PROMPT, VALID_ACTIONS
+
+log = logging.getLogger("gemini_client")
+
+# Gemini occasionally returns these transiently (overloaded / rate limited).
+# Retry with exponential backoff instead of failing the whole task run.
+RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
+MAX_RETRIES = 5
+BASE_BACKOFF_SECONDS = 2
 
 
 class GeminiDecisionError(Exception):
@@ -64,14 +74,48 @@ def decide_next_action(task: str, url: str, dom_elements: list, history: list) -
         },
     }
 
-    resp = requests.post(
-        GEMINI_ENDPOINT,
-        params={"key": GEMINI_API_KEY},
-        json=payload,
-        timeout=30,
-    )
-    resp.raise_for_status()
-    data = resp.json()
+    data = None
+    last_error = None
+
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            resp = requests.post(
+                GEMINI_ENDPOINT,
+                params={"key": GEMINI_API_KEY},
+                json=payload,
+                timeout=30,
+            )
+            if resp.status_code in RETRYABLE_STATUS_CODES:
+                wait = BASE_BACKOFF_SECONDS * (2 ** (attempt - 1))
+                log.warning(
+                    "Gemini returned %s (attempt %d/%d), retrying in %ds...",
+                    resp.status_code, attempt, MAX_RETRIES, wait,
+                )
+                last_error = requests.exceptions.HTTPError(
+                    f"{resp.status_code} error from Gemini", response=resp
+                )
+                time.sleep(wait)
+                continue
+
+            resp.raise_for_status()
+            data = resp.json()
+            break
+
+        except requests.exceptions.RequestException as e:
+            # Network-level issues (timeouts, connection resets) are also
+            # worth a retry rather than killing the whole task.
+            last_error = e
+            wait = BASE_BACKOFF_SECONDS * (2 ** (attempt - 1))
+            log.warning(
+                "Gemini request failed (%s), attempt %d/%d, retrying in %ds...",
+                e, attempt, MAX_RETRIES, wait,
+            )
+            time.sleep(wait)
+
+    if data is None:
+        raise GeminiDecisionError(
+            f"Gemini API failed after {MAX_RETRIES} attempts: {last_error}"
+        )
 
     try:
         raw_text = data["candidates"][0]["content"]["parts"][0]["text"]
