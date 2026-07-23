@@ -48,14 +48,27 @@ def _build_user_prompt(task: str, url: str, dom_elements: list, history: list) -
 def _extract_json(raw_text: str) -> dict:
     # Strip accidental markdown fences if the model adds them anyway.
     cleaned = re.sub(r"^```(json)?|```$", "", raw_text.strip(), flags=re.MULTILINE).strip()
+
+    start = cleaned.find("{")
+    if start == -1:
+        raise GeminiDecisionError(f"No JSON object found in Gemini response: {raw_text!r}")
+
+    # raw_decode parses only the first valid JSON value starting at `start`
+    # and explicitly ignores anything trailing it (extra prose, a second
+    # object, stray newlines, etc.) instead of choking on it like a naive
+    # json.loads() or a greedy regex would.
+    decoder = json.JSONDecoder()
     try:
-        return json.loads(cleaned)
-    except json.JSONDecodeError:
-        # Fall back to grabbing the first {...} block in the text.
-        match = re.search(r"\{.*\}", cleaned, flags=re.DOTALL)
-        if not match:
-            raise GeminiDecisionError(f"Could not parse JSON from Gemini response: {raw_text!r}")
-        return json.loads(match.group(0))
+        obj, _end_index = decoder.raw_decode(cleaned, start)
+    except json.JSONDecodeError as e:
+        raise GeminiDecisionError(
+            f"Could not parse JSON from Gemini response: {raw_text!r} ({e})"
+        ) from e
+
+    if not isinstance(obj, dict):
+        raise GeminiDecisionError(f"Gemini JSON was not an object: {obj!r}")
+
+    return obj
 
 
 def decide_next_action(task: str, url: str, dom_elements: list, history: list) -> tuple:
