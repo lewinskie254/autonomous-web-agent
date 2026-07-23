@@ -11,7 +11,7 @@ import time
 
 import requests
 
-from config import GEMINI_API_KEY, GEMINI_ENDPOINT
+from config import GEMINI_API_KEY, GEMINI_ENDPOINT, GEMINI_MIN_INTERVAL_SECONDS
 from actions import SYSTEM_PROMPT, VALID_ACTIONS
 
 log = logging.getLogger("gemini_client")
@@ -21,6 +21,20 @@ log = logging.getLogger("gemini_client")
 RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 MAX_RETRIES = 5
 BASE_BACKOFF_SECONDS = 2
+
+# Proactive throttle: space out calls so we stay under free-tier rate limits
+# instead of relying solely on reactive 429 retries (which stack up fast on
+# a fast-moving agent loop). Tune via GEMINI_MIN_INTERVAL_SECONDS in .env.
+_last_call_time = 0.0
+
+
+def _throttle():
+    global _last_call_time
+    elapsed = time.monotonic() - _last_call_time
+    wait = GEMINI_MIN_INTERVAL_SECONDS - elapsed
+    if wait > 0:
+        time.sleep(wait)
+    _last_call_time = time.monotonic()
 
 
 class GeminiDecisionError(Exception):
@@ -92,6 +106,7 @@ def decide_next_action(task: str, url: str, dom_elements: list, history: list) -
 
     for attempt in range(1, MAX_RETRIES + 1):
         try:
+            _throttle()
             resp = requests.post(
                 GEMINI_ENDPOINT,
                 params={"key": GEMINI_API_KEY},
