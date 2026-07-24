@@ -43,17 +43,21 @@ class GeminiDecisionError(Exception):
 
 def _build_user_prompt(task: str, url: str, dom_elements: list, history: list) -> str:
     history_lines = []
-    for i, h in enumerate(history[-8:], 1):  # keep prompt bounded
+    for i, h in enumerate(history[-5:], 1):  # keep prompt bounded
         history_lines.append(
             f"{i}. action={h['action']} ref={h.get('ref')} value={h.get('value')!r} "
             f"-> {h.get('outcome', 'ok')}"
         )
     history_text = "\n".join(history_lines) if history_lines else "(none yet)"
 
+    # Compact separators (no spaces after , or :) shave a meaningful chunk
+    # off the token count on pages with many elements.
+    dom_json = json.dumps(dom_elements, separators=(",", ":"))
+
     return (
         f"TASK: {task}\n\n"
         f"CURRENT URL: {url}\n\n"
-        f"DOM ELEMENTS (JSON):\n{json.dumps(dom_elements)}\n\n"
+        f"DOM ELEMENTS (JSON):\n{dom_json}\n\n"
         f"HISTORY:\n{history_text}\n\n"
         f"Choose the next action as a single JSON object per the schema."
     )
@@ -98,6 +102,7 @@ def decide_next_action(task: str, url: str, dom_elements: list, history: list) -
         "generationConfig": {
             "temperature": 0.2,
             "response_mime_type": "application/json",
+            "maxOutputTokens": 300,
         },
     }
 
