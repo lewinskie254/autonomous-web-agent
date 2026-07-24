@@ -23,6 +23,7 @@ from config import MAX_STEPS, HEADLESS, NAV_TIMEOUT_MS
 from dom_extractor import extract_dom
 from gemini_client import decide_next_action, GeminiDecisionError
 from executor import execute_action, ActionExecutionError
+from safety import check_click_safety
 from db import TaskLogger
 
 logging.basicConfig(
@@ -113,6 +114,35 @@ def run_task(task_description: str, start_url: str, website_name: str = None) ->
                 history.append({"action": "done", "outcome": "task complete"})
                 break
 
+            # --- Safety guardrail: never let the agent complete a real
+            # purchase, and always stop right after an add-to-cart click ---
+            safety_verdict = None
+            matched_text = None
+            if action["action"] == "click":
+                safety_verdict, matched_text = check_click_safety(dom_elements, action.get("ref"))
+
+            if safety_verdict == "block":
+                log.warning(
+                    "SAFETY: refusing to click a purchase-completing element (matched %r). Halting task.",
+                    matched_text,
+                )
+                step_duration_ms = int((time.time() - step_start) * 1000)
+                step_id = logger.log_step(
+                    step_number, current_url, dom_elements, gemini_prompt_summary,
+                    raw_response, "blocked", action, step_duration_ms,
+                )
+                logger.log_error(
+                    "blocked_purchase_action",
+                    f"Refused to click element matching purchase keywords: {matched_text!r}",
+                    step_id=step_id,
+                )
+                success = False
+                final_result = (
+                    f"Stopped for safety: the next click ({matched_text!r}) looked like it would "
+                    "finalize a purchase, so the agent refused to proceed."
+                )
+                break
+
             try:
                 outcome = execute_action(page, action)
                 step_error = None
@@ -130,6 +160,16 @@ def run_task(task_description: str, start_url: str, website_name: str = None) ->
 
             if step_error:
                 logger.log_error("element_action_failed", step_error, step_id=step_id)
+
+            if safety_verdict == "stop_after" and not step_error:
+                log.info(
+                    "SAFETY: add-to-cart action detected (matched %r). Halting task here to avoid checkout.",
+                    matched_text,
+                )
+                success = True
+                final_result = f"Added item to cart (matched {matched_text!r}). Stopped here as a safety measure before checkout."
+                history.append({"action": action["action"], "ref": action.get("ref"), "value": action.get("value"), "outcome": outcome})
+                break
 
             history.append(
                 {

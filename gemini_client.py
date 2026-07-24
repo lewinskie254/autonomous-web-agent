@@ -89,6 +89,22 @@ def _extract_json(raw_text: str) -> dict:
     return obj
 
 
+RESPONSE_SCHEMA = {
+    "type": "OBJECT",
+    "properties": {
+        "reasoning": {"type": "STRING"},
+        "action": {
+            "type": "STRING",
+            "enum": ["click", "type", "navigate", "scroll", "go_back", "wait", "done"],
+        },
+        "ref": {"type": "INTEGER"},
+        "value": {"type": "STRING"},
+        "result": {"type": "STRING"},
+    },
+    "required": ["reasoning", "action"],
+}
+
+
 def decide_next_action(task: str, url: str, dom_elements: list, history: list) -> tuple:
     """
     Returns (action_dict, raw_response_text).
@@ -102,7 +118,15 @@ def decide_next_action(task: str, url: str, dom_elements: list, history: list) -
         "generationConfig": {
             "temperature": 0.2,
             "response_mime_type": "application/json",
-            "maxOutputTokens": 300,
+            "response_schema": RESPONSE_SCHEMA,
+            "maxOutputTokens": 500,
+            # gemini-3.5-flash is a "thinking" model whose internal reasoning
+            # tokens count against maxOutputTokens. We don't need deep
+            # reasoning for a short structured action choice, and leaving
+            # thinking on was silently eating the whole output budget
+            # (finishReason=MAX_TOKENS with empty content). Disabling it
+            # fixes that AND reduces token cost.
+            "thinkingConfig": {"thinkingBudget": 0},
         },
     }
 
