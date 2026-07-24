@@ -17,22 +17,30 @@ class TaskLogger:
     """
     One TaskLogger instance corresponds to one agent run on one task/website.
     Usage:
-        logger = TaskLogger(task_description, start_url, website_name="shopify_a")
+        logger = TaskLogger(task_description, start_url, website_name="shopify_a",
+                             agent_type="baseline")  # or "hybrid"
         logger.start()
         ... per step ...
         logger.log_step(step_number, url, dom_snapshot, gemini_prompt,
                          gemini_raw_response, action_type, action_payload,
-                         step_duration_ms)
+                         step_duration_ms, confidence=0.8, used_screenshot=False)
         ... on error ...
         logger.log_error("timeout", "element not found", step_id=step_id)
         ... at the end ...
         logger.finish(success=True, final_result="...")
     """
 
-    def __init__(self, task_description: str, start_url: str, website_name: str = None):
+    def __init__(
+        self,
+        task_description: str,
+        start_url: str,
+        website_name: str = None,
+        agent_type: str = "baseline",
+    ):
         self.task_description = task_description
         self.start_url = start_url
         self.website_name = website_name
+        self.agent_type = agent_type
         self.task_id = None
         self.step_count = 0
 
@@ -42,11 +50,11 @@ class TaskLogger:
             with conn, conn.cursor() as cur:
                 cur.execute(
                     """
-                    INSERT INTO tasks (task_description, start_url, website_name, status)
-                    VALUES (%s, %s, %s, 'running')
+                    INSERT INTO tasks (task_description, start_url, website_name, agent_type, status)
+                    VALUES (%s, %s, %s, %s, 'running')
                     RETURNING id
                     """,
-                    (self.task_description, self.start_url, self.website_name),
+                    (self.task_description, self.start_url, self.website_name, self.agent_type),
                 )
                 self.task_id = cur.fetchone()[0]
         finally:
@@ -63,6 +71,9 @@ class TaskLogger:
         action_type: str,
         action_payload: dict,
         step_duration_ms: int,
+        confidence: float = None,
+        used_screenshot: bool = False,
+        screenshot_path: str = None,
     ) -> int:
         conn = get_connection()
         try:
@@ -72,8 +83,8 @@ class TaskLogger:
                     INSERT INTO steps (
                         task_id, step_number, url, dom_snapshot, dom_element_count,
                         gemini_prompt, gemini_raw_response, action_type, action_payload,
-                        step_duration_ms
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        confidence, used_screenshot, screenshot_path, step_duration_ms
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     RETURNING id
                     """,
                     (
@@ -86,6 +97,9 @@ class TaskLogger:
                         gemini_raw_response,
                         action_type,
                         json.dumps(action_payload),
+                        confidence,
+                        used_screenshot,
+                        screenshot_path,
                         step_duration_ms,
                     ),
                 )

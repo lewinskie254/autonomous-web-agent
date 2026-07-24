@@ -34,6 +34,7 @@ MAX_STEPS = int(os.getenv("MAX_STEPS", "25"))
 NAV_TIMEOUT_MS = int(os.getenv("NAV_TIMEOUT_MS", "15000"))
 HEADLESS = _bool("HEADLESS", True)
 GEMINI_MIN_INTERVAL_SECONDS = float(os.getenv("GEMINI_MIN_INTERVAL_SECONDS", "4.5"))
+CONFIDENCE_THRESHOLD = float(os.getenv("CONFIDENCE_THRESHOLD", "0.6"))
 
 if not GEMINI_API_KEY:
     raise RuntimeError(

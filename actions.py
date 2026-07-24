@@ -24,7 +24,10 @@ matching this schema:
   "action": "click" | "type" | "navigate" | "scroll" | "go_back" | "wait" | "done",
   "ref": <integer ref of the target element, required for click/type, omit otherwise>,
   "value": "<text to type, or URL for navigate, or 'up'/'down' for scroll>",
-  "result": "<only when action is 'done': the final answer/result for the task>"
+  "result": "<only when action is 'done': the final answer/result for the task>",
+  "confidence": <float between 0.0 and 1.0: how confident you are that this \
+is the correct action, based only on the DOM element list (ignore any \
+screenshot when scoring this, if one is provided)>
 }
 
 Rules:
@@ -41,4 +44,18 @@ be completed, and put the answer or a short explanation in "result".
 - Never invent a ref that is not in the provided DOM list.
 - If you keep seeing the same DOM state after repeated actions, try a \
 different element or scroll instead of repeating the same action.
+- Always include "confidence": be honest and low (e.g. 0.2-0.4) when the DOM \
+element list is ambiguous, has many similarly-labeled elements, or you're \
+guessing at layout/visual meaning from tag/text alone.
+"""
+
+VISION_ADDENDUM = """
+
+You are ALSO being shown a screenshot of the current page state, because \
+your confidence from the DOM alone was low. Use the screenshot to resolve \
+ambiguity: match visible layout/labels to the "ref" ids in the DOM list, \
+notice elements that are visually prominent but sparsely described in the \
+DOM, and check for anything the DOM list might misrepresent (overlapping \
+elements, hidden/collapsed sections, icon-only buttons). Give your FINAL \
+decision now using both sources together.
 """

@@ -4,6 +4,7 @@ per your preference to avoid an SDK dependency. Sends the system prompt,
 task, current URL, DOM element JSON, and action history; parses the model's
 JSON action out of the response text.
 """
+import base64
 import json
 import logging
 import re
@@ -12,7 +13,7 @@ import time
 import requests
 
 from config import GEMINI_API_KEY, GEMINI_ENDPOINT, GEMINI_MIN_INTERVAL_SECONDS
-from actions import SYSTEM_PROMPT, VALID_ACTIONS
+from actions import SYSTEM_PROMPT, VALID_ACTIONS, VISION_ADDENDUM
 
 log = logging.getLogger("gemini_client")
 
@@ -100,36 +101,17 @@ RESPONSE_SCHEMA = {
         "ref": {"type": "INTEGER"},
         "value": {"type": "STRING"},
         "result": {"type": "STRING"},
+        "confidence": {"type": "NUMBER"},
     },
-    "required": ["reasoning", "action"],
+    "required": ["reasoning", "action", "confidence"],
 }
 
 
-def decide_next_action(task: str, url: str, dom_elements: list, history: list) -> tuple:
+def _call_gemini(payload: dict) -> dict:
     """
-    Returns (action_dict, raw_response_text).
-    Raises GeminiDecisionError on malformed/invalid responses.
+    POSTs to Gemini with throttling and retry/backoff on transient errors.
+    Returns the parsed response JSON, or raises GeminiDecisionError.
     """
-    user_prompt = _build_user_prompt(task, url, dom_elements, history)
-
-    payload = {
-        "system_instruction": {"parts": [{"text": SYSTEM_PROMPT}]},
-        "contents": [{"role": "user", "parts": [{"text": user_prompt}]}],
-        "generationConfig": {
-            "temperature": 0.2,
-            "response_mime_type": "application/json",
-            "response_schema": RESPONSE_SCHEMA,
-            "maxOutputTokens": 500,
-            # gemini-3.5-flash is a "thinking" model whose internal reasoning
-            # tokens count against maxOutputTokens. We don't need deep
-            # reasoning for a short structured action choice, and leaving
-            # thinking on was silently eating the whole output budget
-            # (finishReason=MAX_TOKENS with empty content). Disabling it
-            # fixes that AND reduces token cost.
-            "thinkingConfig": {"thinkingBudget": 0},
-        },
-    }
-
     data = None
     last_error = None
 
@@ -173,6 +155,57 @@ def decide_next_action(task: str, url: str, dom_elements: list, history: list) -
         raise GeminiDecisionError(
             f"Gemini API failed after {MAX_RETRIES} attempts: {last_error}"
         )
+    return data
+
+
+def decide_next_action(
+    task: str,
+    url: str,
+    dom_elements: list,
+    history: list,
+    screenshot_png_bytes: bytes = None,
+) -> tuple:
+    """
+    Returns (action_dict, raw_response_text).
+    Raises GeminiDecisionError on malformed/invalid responses.
+
+    If `screenshot_png_bytes` is provided, this becomes a multimodal call:
+    the same DOM JSON + task + history is sent alongside the screenshot, and
+    the model is told (via VISION_ADDENDUM) to use both together for its
+    final decision. This is the hybrid agent's confidence-escalation path;
+    the baseline agent never passes a screenshot, so the two agents share
+    byte-for-byte identical prompts on their normal (non-escalated) calls,
+    per the "identical prompts" fairness requirement.
+    """
+    user_prompt = _build_user_prompt(task, url, dom_elements, history)
+
+    parts = []
+    if screenshot_png_bytes is not None:
+        user_prompt += VISION_ADDENDUM
+    parts.append({"text": user_prompt})
+    if screenshot_png_bytes is not None:
+        b64_image = base64.b64encode(screenshot_png_bytes).decode("ascii")
+        parts.append({"inline_data": {"mime_type": "image/png", "data": b64_image}})
+
+    payload = {
+        "system_instruction": {"parts": [{"text": SYSTEM_PROMPT}]},
+        "contents": [{"role": "user", "parts": parts}],
+        "generationConfig": {
+            "temperature": 0.2,
+            "response_mime_type": "application/json",
+            "response_schema": RESPONSE_SCHEMA,
+            "maxOutputTokens": 500,
+            # gemini-3.5-flash is a "thinking" model whose internal reasoning
+            # tokens count against maxOutputTokens. We don't need deep
+            # reasoning for a short structured action choice, and leaving
+            # thinking on was silently eating the whole output budget
+            # (finishReason=MAX_TOKENS with empty content). Disabling it
+            # fixes that AND reduces token cost.
+            "thinkingConfig": {"thinkingBudget": 0},
+        },
+    }
+
+    data = _call_gemini(payload)
 
     try:
         raw_text = data["candidates"][0]["content"]["parts"][0]["text"]

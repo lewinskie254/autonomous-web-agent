@@ -1,25 +1,28 @@
 """
-The baseline DOM-only agent's main control loop.
+The hybrid agent's main control loop, per Chapter 3's design.
 
-    extract_dom -> decide_next_action (Gemini) -> execute_action (Playwright)
-    -> log_step (Postgres) -> repeat until Gemini emits "done" or MAX_STEPS
-    is reached.
+    extract_dom -> decide_next_action (DOM-only, Gemini) -> if confidence
+    < CONFIDENCE_THRESHOLD: screenshot -> decide_next_action AGAIN (DOM +
+    screenshot, multimodal) -> execute_action (Playwright) -> log_step
+    (Postgres, records confidence + whether the screenshot fallback fired)
+    -> repeat until "done" or MAX_STEPS.
 
-This is intentionally kept separate from the (future) hybrid agent's loop,
-which will add a screenshot fallback when Gemini's confidence is low, so the
-two can be compared under identical conditions per Chapter 3.
-
-Live progress is printed to the console via the `logging` module (INFO
-level) so you can watch what the agent is doing step by step. Set
-LOG_LEVEL=DEBUG in .env for more detail (raw Gemini responses included).
+Everything else (DOM extraction, executor, safety guardrail, Postgres
+logging, retry/throttle behaviour, MAX_STEPS/NAV_TIMEOUT_MS/HEADLESS) is
+byte-for-byte shared with the baseline agent (agent.py), and the system
+prompt/response schema Gemini sees on the DOM-only call is identical between
+the two agents. The *only* difference is this confidence-gated escalation
+step -- which is exactly what Chapter 3's "Experimental Environment"
+fairness requirement calls for when comparing the two.
 """
 import logging
 import os
 import time
+from pathlib import Path
 
 from playwright.sync_api import sync_playwright
 
-from config import MAX_STEPS, HEADLESS, NAV_TIMEOUT_MS
+from config import MAX_STEPS, HEADLESS, NAV_TIMEOUT_MS, CONFIDENCE_THRESHOLD
 from dom_extractor import extract_dom
 from gemini_client import decide_next_action, GeminiDecisionError
 from executor import execute_action, ActionExecutionError
@@ -31,24 +34,31 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%H:%M:%S",
 )
-log = logging.getLogger("agent")
+log = logging.getLogger("hybrid_agent")
+
+SCREENSHOT_DIR = Path("screenshots")
 
 
 def run_task(task_description: str, start_url: str, website_name: str = None) -> dict:
     """
-    Runs a single task end-to-end and returns a summary dict:
-    {task_id, success, steps, final_result, duration_ms}
+    Runs a single task end-to-end with the hybrid (DOM + confidence-gated
+    vision fallback) agent. Returns a summary dict:
+    {task_id, success, steps, final_result, duration_ms, screenshot_calls}
     """
-    log.info("Starting task: %r", task_description)
+    log.info("Starting HYBRID task: %r", task_description)
     log.info("Start URL: %s", start_url)
+    log.info("Confidence threshold for screenshot escalation: %.2f", CONFIDENCE_THRESHOLD)
 
-    logger = TaskLogger(task_description, start_url, website_name=website_name)
+    logger = TaskLogger(task_description, start_url, website_name=website_name, agent_type="hybrid")
     task_id = logger.start()
-    log.info("Task logged in Postgres as task_id=%s", task_id)
+    log.info("Task logged in Postgres as task_id=%s (agent_type=hybrid)", task_id)
+
+    task_screenshot_dir = SCREENSHOT_DIR / str(task_id)
 
     history = []
     success = False
     final_result = None
+    screenshot_calls = 0
     start_time = time.time()
 
     with sync_playwright() as p:
@@ -67,11 +77,9 @@ def run_task(task_description: str, start_url: str, website_name: str = None) ->
             logger.finish(success=False, final_result=f"Could not load start_url: {e}")
             browser.close()
             return {
-                "task_id": task_id,
-                "success": False,
-                "steps": 0,
-                "final_result": None,
-                "duration_ms": int((time.time() - start_time) * 1000),
+                "task_id": task_id, "success": False, "steps": 0,
+                "final_result": None, "duration_ms": int((time.time() - start_time) * 1000),
+                "screenshot_calls": 0,
             }
 
         for step_number in range(1, MAX_STEPS + 1):
@@ -82,23 +90,60 @@ def run_task(task_description: str, start_url: str, website_name: str = None) ->
             current_url = page.url
             log.info("URL: %s | %d interactive elements found", current_url, len(dom_elements))
 
+            # --- Pass 1: DOM-only decision (identical to the baseline agent) ---
             try:
-                log.info("Asking Gemini for next action...")
+                log.info("Asking Gemini for next action (DOM-only)...")
                 action, raw_response = decide_next_action(
                     task_description, current_url, dom_elements, history
                 )
-                log.debug("Raw Gemini response: %s", raw_response)
             except GeminiDecisionError as e:
                 log.warning("Gemini decision error: %s", e)
                 logger.log_error("gemini_parse_error", str(e))
                 history.append({"action": "error", "outcome": f"gemini error: {e}"})
                 continue
 
-            reasoning = action.get("reasoning", "")
+            confidence = action.get("confidence")
+            used_screenshot = False
+            screenshot_path = None
+
             log.info(
-                "Gemini chose action=%s ref=%s value=%r | reasoning: %s",
-                action["action"], action.get("ref"), action.get("value"), reasoning,
+                "DOM-only decision: action=%s ref=%s confidence=%s | reasoning: %s",
+                action["action"], action.get("ref"), confidence, action.get("reasoning", ""),
             )
+
+            # --- Pass 2 (only if triggered): screenshot + multimodal re-decision ---
+            if (
+                action["action"] != "done"
+                and confidence is not None
+                and confidence < CONFIDENCE_THRESHOLD
+            ):
+                log.info(
+                    "Confidence %.2f < threshold %.2f -> escalating to screenshot fallback",
+                    confidence, CONFIDENCE_THRESHOLD,
+                )
+                try:
+                    screenshot_bytes = page.screenshot(type="png")
+                    task_screenshot_dir.mkdir(parents=True, exist_ok=True)
+                    screenshot_path = str(task_screenshot_dir / f"step_{step_number}.png")
+                    with open(screenshot_path, "wb") as f:
+                        f.write(screenshot_bytes)
+
+                    vision_action, vision_raw = decide_next_action(
+                        task_description, current_url, dom_elements, history,
+                        screenshot_png_bytes=screenshot_bytes,
+                    )
+                    log.info(
+                        "Vision-augmented decision: action=%s ref=%s | reasoning: %s",
+                        vision_action["action"], vision_action.get("ref"), vision_action.get("reasoning", ""),
+                    )
+                    action = vision_action
+                    raw_response = vision_raw
+                    used_screenshot = True
+                    screenshot_calls += 1
+                except GeminiDecisionError as e:
+                    log.warning("Vision escalation failed, falling back to DOM-only decision: %s", e)
+                    logger.log_error("gemini_vision_error", str(e))
+                    # Keep the original DOM-only `action` as the fallback.
 
             gemini_prompt_summary = f"task={task_description!r} url={current_url}"
 
@@ -110,13 +155,13 @@ def run_task(task_description: str, start_url: str, website_name: str = None) ->
                 logger.log_step(
                     step_number, current_url, dom_elements, gemini_prompt_summary,
                     raw_response, "done", action, step_duration_ms,
-                    confidence=action.get("confidence"),
+                    confidence=action.get("confidence"), used_screenshot=used_screenshot,
+                    screenshot_path=screenshot_path,
                 )
                 history.append({"action": "done", "outcome": "task complete"})
                 break
 
-            # --- Safety guardrail: never let the agent complete a real
-            # purchase, and always stop right after an add-to-cart click ---
+            # --- Safety guardrail (identical to the baseline agent) ---
             safety_verdict = None
             matched_text = None
             if action["action"] == "click":
@@ -131,7 +176,8 @@ def run_task(task_description: str, start_url: str, website_name: str = None) ->
                 step_id = logger.log_step(
                     step_number, current_url, dom_elements, gemini_prompt_summary,
                     raw_response, "blocked", action, step_duration_ms,
-                    confidence=action.get("confidence"),
+                    confidence=action.get("confidence"), used_screenshot=used_screenshot,
+                    screenshot_path=screenshot_path,
                 )
                 logger.log_error(
                     "blocked_purchase_action",
@@ -158,7 +204,8 @@ def run_task(task_description: str, start_url: str, website_name: str = None) ->
             step_id = logger.log_step(
                 step_number, current_url, dom_elements, gemini_prompt_summary,
                 raw_response, action["action"], action, step_duration_ms,
-                confidence=action.get("confidence"),
+                confidence=action.get("confidence"), used_screenshot=used_screenshot,
+                screenshot_path=screenshot_path,
             )
 
             if step_error:
@@ -183,7 +230,6 @@ def run_task(task_description: str, start_url: str, website_name: str = None) ->
                 }
             )
         else:
-            # Loop exhausted MAX_STEPS without "done"
             final_result = "Max steps reached without completing the task."
             log.warning(final_result)
             logger.log_error("max_steps_reached", final_result)
@@ -193,7 +239,10 @@ def run_task(task_description: str, start_url: str, website_name: str = None) ->
 
     duration_ms = int((time.time() - start_time) * 1000)
     logger.finish(success=success, final_result=final_result)
-    log.info("Task finished. success=%s duration=%dms steps=%d", success, duration_ms, logger.step_count)
+    log.info(
+        "Task finished. success=%s duration=%dms steps=%d screenshot_calls=%d",
+        success, duration_ms, logger.step_count, screenshot_calls,
+    )
 
     return {
         "task_id": task_id,
@@ -201,4 +250,5 @@ def run_task(task_description: str, start_url: str, website_name: str = None) ->
         "steps": logger.step_count,
         "final_result": final_result,
         "duration_ms": duration_ms,
+        "screenshot_calls": screenshot_calls,
     }

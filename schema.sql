@@ -6,6 +6,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     task_description TEXT NOT NULL,
     start_url       TEXT NOT NULL,
     website_name    TEXT,                       -- e.g. "shopify_store_a" (for generalization grouping)
+    agent_type      TEXT NOT NULL DEFAULT 'baseline', -- 'baseline' | 'hybrid' (for comparing the two agents)
     status          TEXT NOT NULL DEFAULT 'running', -- running | success | failure | error
     final_result    TEXT,                        -- text the agent returns when it signals DONE
     total_steps     INTEGER DEFAULT 0,
@@ -24,8 +25,11 @@ CREATE TABLE IF NOT EXISTS steps (
     dom_element_count  INTEGER,
     gemini_prompt      TEXT,        -- the user/task portion of the prompt sent (system prompt is static, not duplicated)
     gemini_raw_response TEXT,       -- raw text Gemini returned
-    action_type        TEXT,        -- click | type | navigate | scroll | go_back | done | error
-    action_payload     JSONB,       -- parsed action: {ref, value, url, ...}
+    action_type        TEXT,        -- click | type | navigate | scroll | go_back | done | blocked | error
+    action_payload     JSONB,       -- parsed action: {ref, value, url, confidence, ...}
+    confidence         REAL,        -- Gemini's self-reported confidence for this decision (both agents)
+    used_screenshot    BOOLEAN NOT NULL DEFAULT FALSE, -- hybrid agent only: was the vision fallback triggered?
+    screenshot_path    TEXT,        -- path to the saved screenshot, if used_screenshot is true
     step_duration_ms   INTEGER,
     created_at         TIMESTAMPTZ NOT NULL DEFAULT now()
 );
