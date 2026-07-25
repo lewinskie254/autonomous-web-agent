@@ -1,156 +1,143 @@
-# DOM-Only Baseline Web Agent + Hybrid Vision Agent
+# WebGent 🕸️🤖
 
-Two agents, matching Chapter 3's design so they can be compared head-to-head:
+**An autonomous web browsing agent that navigates real websites using nothing but the DOM — no fixed selectors, no site-specific scraping code, no vision required (with an optional hybrid mode that adds screenshots when it gets stuck).**
 
-- **Baseline** (`agent.py` / `run_task.py`) — DOM-only, as before.
-- **Hybrid** (`hybrid_agent.py` / `run_hybrid_task.py`) — same DOM-only
-  decision first, but if Gemini's self-reported `confidence` on that
-  decision is below `CONFIDENCE_THRESHOLD`, it takes a screenshot and asks
-  Gemini again with both the DOM JSON *and* the image, then uses that
-  answer instead.
+Give it a task like *"find the cheapest watch under $500"* and a starting URL, and it drives a real Chromium browser: reading the page's interactive elements, deciding what to click/type/scroll next, and executing that action — all reasoned about step by step by Gemini.
 
-The two agents share literally the same `SYSTEM_PROMPT`/response schema,
-DOM extractor, executor, safety guardrail, and Postgres logger — the
-*only* difference is the confidence-gated screenshot escalation, which is
-exactly the fairness requirement in your "Experimental Environment"
-section.
+---
+
+## What makes this different
+
+Most web-scraping bots are hard-coded for one site: they know exactly which CSS selector to click because a human wrote it for that specific page. This agent doesn't. It:
+
+1. Loads any page and extracts every visible, clickable/typeable element into a compact JSON list — tag, text, labels, no fragile selectors.
+2. Hands that list, the task, and recent history to Gemini and asks it to choose exactly one next action.
+3. Executes that action in the real browser, then repeats — reading the new page state fresh each time.
+
+Because it never depends on a site's own (often meaningless) class names or IDs, it can be pointed at a site it's never seen before and figure out the navigation on its own.
+
+## Two agent modes
+
+| | **Baseline** | **Hybrid** |
+|---|---|---|
+| Perception | DOM only | DOM first, screenshot only when confidence is low |
+| Speed | Faster | Slower (extra vision call when triggered) |
+| Cost | Lower | Higher (only pays the vision-token cost when it actually needs it) |
+| Best for | Well-structured pages | Visually complex / ambiguous layouts, icon-only buttons, elements that look different than their DOM order suggests |
+
+Both modes share the exact same prompt, response schema, DOM extractor, executor, and safety layer — the *only* difference is whether a screenshot gets added to the decision when Gemini isn't confident. This makes it easy to run the same task through both and compare which one actually performs better on a given site.
+
+## Built-in safety
+
+The agent will **never complete a real purchase**. Every click is checked against the target element's own label before it's executed:
+
+- Clicks that look like they'd finalize a transaction ("Buy Now," "Place Order," "Checkout," "Pay Now," "Confirm Purchase," etc.) are **refused outright** — the agent won't click them no matter what it decided.
+- "Add to Cart" / "Add to Bag" clicks are allowed (they're non-committal), but the agent **halts the run immediately afterward**, so it can never chain into an actual checkout flow.
 
 ## Architecture
 
 ```
-run_task.py                 CLI for the baseline agent
-run_hybrid_task.py           CLI for the hybrid agent
-agent.py                     Baseline control loop
-hybrid_agent.py               Hybrid control loop (adds confidence-gated screenshot escalation)
-dom_extractor.py               Playwright + BeautifulSoup -> JSON of interactive elements (shared)
-gemini_client.py                Gemini REST calls; decide_next_action() takes an optional
-                                 screenshot_png_bytes for the hybrid agent's escalation call (shared)
-actions.py                      Action vocabulary + system prompt + VISION_ADDENDUM (shared)
-executor.py                     Executes a decided action via Playwright (shared)
-safety.py                       Purchase-blocking / add-to-cart-stops-run guardrail (shared)
-db.py                           Postgres logging: agent_type, confidence, used_screenshot, screenshot_path
-metrics.py                      Computes Chapter 3 metrics PER AGENT and prints them side by side
-config.py                       Env var loading, incl. CONFIDENCE_THRESHOLD
-schema.sql                      Fresh-install Postgres schema (includes hybrid columns)
-migrate_add_hybrid.sql           Run this instead if you already have a DB from before the hybrid agent existed
-screenshots/<task_id>/step_N.png  Saved automatically whenever the hybrid agent escalates
+run_task.py                  CLI — baseline agent
+run_hybrid_task.py            CLI — hybrid agent
+agent.py                      Baseline control loop: perceive → decide → act → log
+hybrid_agent.py                 Hybrid control loop: adds confidence-gated screenshot escalation
+dom_extractor.py                 Playwright + BeautifulSoup → JSON of interactive DOM elements
+gemini_client.py                  Talks to the Gemini API directly over REST (no SDK dependency)
+actions.py                         Action vocabulary + system prompt shared by both agents
+executor.py                         Turns a decided action into a real Playwright interaction
+safety.py                            Purchase-blocking guardrail
+db.py                                 PostgreSQL logging: every task, step, and error
+metrics.py                            Computes success rate / speed / errors, baseline vs hybrid
+config.py                             Environment-driven configuration
+schema.sql                            Database schema
 ```
 
-### Why `data-agent-ref`?
+## How a step works
 
-Real sites use meaningless class/id names, which is exactly the problem your
-proposal calls out. Instead of asking Gemini to guess a CSS selector, the
-extractor injects a `data-agent-ref="N"` attribute onto every visible,
-enabled interactive element in the live DOM before scraping it. Gemini only
-ever has to reason about integers (`ref`), and the executor clicks/types by
-that same attribute — so element targeting is stable and site-agnostic.
+```
+┌─────────────┐     ┌────────────────┐     ┌───────────────┐     ┌──────────────┐
+│  Load page  │ --> │  Extract DOM   │ --> │  Ask Gemini    │ --> │  Execute the │
+│ (Playwright)│     │ as JSON (bs4)  │     │  for an action │     │  action      │
+└─────────────┘     └────────────────┘     └───────────────┘     └──────────────┘
+                                                    │                     │
+                                          (hybrid: if low confidence,     │
+                                           screenshot + re-ask)           ▼
+                                                                   Log to Postgres,
+                                                                   repeat until "done"
+```
 
-## Setup
+## Tech stack
 
-1. **Postgres**: create a database and load the schema.
-   ```bash
-   createdb dom_agent
-   psql -d dom_agent -f schema.sql
-   ```
-   Already have a database from before the hybrid agent existed? Run the
-   migration instead of re-running schema.sql:
-   ```bash
-   psql -U dom_agent_user -d dom_agent -h localhost -f migrate_add_hybrid.sql
-   ```
+- **Python** — orchestration
+- **Playwright** — real browser automation (Chromium)
+- **BeautifulSoup** — DOM parsing into structured JSON
+- **Gemini API** — decision-making, called directly via `requests` (no SDK)
+- **PostgreSQL** — full experiment/run logging (tasks, steps, errors, timings)
 
-2. **Python deps**:
-   ```bash
-   python -m venv venv && source venv/bin/activate
-   pip install -r requirements.txt
-   playwright install chromium
-   ```
+## Quickstart
 
-3. **Config**: copy `env.example` to `.env` and fill in your Gemini API key
-   and Postgres credentials.
-   ```bash
-   cp env.example .env
-   ```
-   Add `CONFIDENCE_THRESHOLD=0.6` (or tune it) if you want to override the
-   default.
+```bash
+git clone <this-repo>
+cd WebGent
+python -m venv venv && source venv/bin/activate
+pip install -r requirements.txt
+playwright install chromium
 
-## Running a task
+createdb dom_agent
+psql -d dom_agent -f schema.sql
 
-Baseline:
+cp env.example .env   # add your GEMINI_API_KEY and Postgres credentials
+```
+
+Run the baseline agent:
 ```bash
 python run_task.py \
-  --task "Search for a wireless mouse and report its price and rating" \
+  --task "find the cheapest watch under $500" \
   --url "https://example-shop.com" \
-  --website shopify_store_a
+  --website example_store
 ```
 
-Hybrid:
+Run the hybrid agent on the same task to compare:
 ```bash
 python run_hybrid_task.py \
-  --task "Search for a wireless mouse and report its price and rating" \
+  --task "find the cheapest watch under $500" \
   --url "https://example-shop.com" \
-  --website shopify_store_a
+  --website example_store
 ```
 
-Run the **same task/URL pairs through both** — that's what makes the
-comparison meaningful. Each prints a JSON summary; the hybrid one also
-includes `screenshot_calls` (how many steps escalated to vision).
-
-Use `--website` consistently across a set of URLs from the same platform
-(Shopify / WooCommerce / Magento / OpenCart / custom) — `metrics.py` groups
-by this label to compute the per-platform generalization score.
-
-## Comparing the two agents (which is faster / more accurate)
-
+Compare results:
 ```bash
 python metrics.py
 ```
+Outputs success rate, average completion time, average steps, and error rate for each agent side by side — plus, for the hybrid agent, exactly how often it needed a screenshot and how much slower those steps were.
 
-Prints a JSON object with `"baseline"` and `"hybrid"` side by side:
-- **Task Success Rate** — `success_rate_pct`
-- **Completion Time** — `avg_completion_time_ms`
-- **Navigation Efficiency** — `avg_steps_per_task`
-- **Error Rate** — `error_rate_per_task`
-- **Generalization Score** — `generalization_by_website`
-- **Hybrid only** — `screenshot_fallback`: what % of steps escalated to
-  vision, and the average step duration **with** vs **without** a
-  screenshot call, so you can see exactly how much the vision fallback
-  costs in time when it fires.
+## Configuration
 
-For the statistical comparison (paired t-test / Wilcoxon signed-rank),
-export `tasks` and `steps` with `pandas.read_sql` using the same
-`PG_CONFIG` in `config.py` (filter on `agent_type`), then feed into
-`scipy.stats`.
+All tunable via `.env`:
 
-## Notes on fairness for the hybrid comparison
+| Variable | Purpose | Default |
+|---|---|---|
+| `GEMINI_MODEL` | Which Gemini model to use | `gemini-2.0-flash` |
+| `MAX_STEPS` | Hard cap on actions per task | `25` |
+| `NAV_TIMEOUT_MS` | Browser navigation timeout | `15000` |
+| `HEADLESS` | Run Chromium headless or visibly | `true` |
+| `GEMINI_MIN_INTERVAL_SECONDS` | Throttle between Gemini calls (avoids rate limits) | `4.5` |
+| `CONFIDENCE_THRESHOLD` | Hybrid agent's cutoff for triggering a screenshot | `0.6` |
 
-- `SYSTEM_PROMPT`/response schema are literally the same Python object
-  (`actions.SYSTEM_PROMPT`, `gemini_client.RESPONSE_SCHEMA`) for both agents
-  — don't fork them per-agent, or you lose the "identical prompts" property.
-- `MAX_STEPS`/`NAV_TIMEOUT_MS`/`HEADLESS`/`GEMINI_MIN_INTERVAL_SECONDS` in
-  `.env` apply to both agents equally.
-- Run the same task/URL pairs through both so `steps`/`errors` rows are
-  directly comparable per task.
-- `CONFIDENCE_THRESHOLD` is the one hybrid-only knob — document whatever
-  value you land on in your methodology, since it directly controls how
-  often the vision fallback fires (and therefore how much slower/costlier
-  the hybrid agent is relative to the baseline).
+## Known limitations
 
-## Known limitations (be upfront about these in your writeup)
+- Single-tab only — doesn't yet handle flows that open a new browser tab/popup.
+- No CAPTCHA or anti-bot bypass — sites with aggressive bot protection may block it outright, and that's treated as an expected failure mode rather than something to defeat.
+- DOM element references are re-assigned every step, so they're not stable across steps by design — always resolved fresh, never cached.
+- The purchase-blocking guardrail is keyword-based against visible element text, not a semantic guarantee — extend `safety.py` if you hit a site with unusual button wording.
 
-- Single-tab only; doesn't handle new-tab/popup flows (e.g. some "Add to
-  Cart" confirmations open a modal, which is fine, but a few sites open a
-  new tab — those will need `context.expect_page()` handling if you hit them).
-- No CAPTCHA/anti-bot handling — sites with aggressive bot detection
-  (Cloudflare/Akamai-protected storefronts, some major retailers) may block
-  headless Chromium outright; that's a valid "generalization failure" data
-  point, not a bug to patch around.
-- `data-agent-ref` injection re-runs every step, so refs are **not stable
-  across steps** — always resolve on the current step's DOM list, never cache
-  a ref from a previous step.
-- The purchase-blocking safety guardrail (`safety.py`) is keyword-based
-  against the target element's own text/label, not a semantic guarantee —
-  sites using unusual phrasing for checkout buttons may not be caught;
-  extend `BLOCK_KEYWORDS`/`STOP_AFTER_KEYWORDS` if you hit that.
-- `CONFIDENCE_THRESHOLD` calibration is itself a design decision worth
-  reporting: too high and the hybrid agent escalates constantly (slow, more
-  tokens); too low and it rarely escalates (behaves like the baseline).
+## Roadmap
+
+- [ ] Multi-tab / popup handling
+- [ ] Configurable action vocabulary (drag/drop, hover, keyboard shortcuts)
+- [ ] Pluggable model backend (beyond Gemini)
+- [ ] Web dashboard for watching runs live instead of console logs
+
+## License
+
+MIT (or whichever you prefer — update this section before publishing).
