@@ -117,7 +117,7 @@ All tunable via `.env`:
 
 | Variable | Purpose | Default |
 |---|---|---|
-| `GEMINI_MODEL` | Which Gemini model to use | `gemini-2.0-flash` |
+| `GEMINI_MODEL` | Which Gemini model to use | `gemini-3.5-flash` |
 | `MAX_STEPS` | Hard cap on actions per task | `25` |
 | `NAV_TIMEOUT_MS` | Browser navigation timeout | `15000` |
 | `HEADLESS` | Run Chromium headless or visibly | `true` |
